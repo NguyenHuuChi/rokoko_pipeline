@@ -1,0 +1,8 @@
+.env
+models/
+third_party/
+data/
+samples/
+takes/
+__pycache__/
+*.pyc

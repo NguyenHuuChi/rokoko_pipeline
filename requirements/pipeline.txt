@@ -1,0 +1,6 @@
+# Python 3.14; versions of the environment the pipeline was run with
+numpy==2.5.3
+pandas==3.0.6
+scipy==1.18.1
+opencv-python-headless==4.14.0.94
+pillow==12.3.0
