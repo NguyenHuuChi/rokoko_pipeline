@@ -60,6 +60,7 @@ cp .env.example .env        # then edit: RAW_ROOT, OUT_ROOT, the four pythons, F
 ```bash
 hf auth login               # account with access to the private weights repo
 bash download_models.sh     # models/ + third_party/WiLoR (code + its weights)
+bash download_fah.sh        # third_party/FAH (YOLO architecture) + models/fah/shared/detector.pt (~52 MB, for fasam/fah)
 ```
 
 **MANO (by hand, its license forbids sharing it)**: WiLoR needs it. Register at https://mano.is.tue.mpg.de, download
@@ -87,13 +88,23 @@ Check the pairing without writing anything: `python prepare_mocap.py RAW_ROOT OU
 
 ```bash
 bash run_final.sh                                          # stages 1-3, every session
-bash run_arm2d.sh SESSION_DIR                              # stages 4-8, whole session, on this machine
+bash run_arm2d.sh SESSION_DIR                              # stages 4-8, default MODE=fasam (M3b)
+bash run_arm2d.sh SESSION_DIR --mode fah                   # M3a: FAH YOLO-seg + RTMPose lock + gap-fill/SavGol -> WiLoR (no SAM 2.1)
+bash run_arm2d.sh SESSION_DIR --mode hand5                 # legacy baseline: RTMPose + Hand5 -> SAM 2/3 -> WiLoR
 JOB=<slurm id> bash run_arm2d.sh SESSION_DIR               # same, GPU steps inside that Slurm job
 JOB=<slurm id> bash run_arm2d.sh SESSION_DIR 0 2400        # only the 240-frame clips starting at these frames
 ```
 
-Use tmux. Expect roughly 6-7 GPU minutes per 240-frame clip. Finished clip steps are skipped on a rerun.
-Options: `WRIST=wilor` (default) or `hand5`; `SEG=sam2` (default) or `sam3`; `LEN=240`.
+Use tmux. Expect roughly 6-7 GPU minutes per 240-frame clip (less for `MODE=fah`). Finished clip steps are skipped on a rerun.
+
+### Hand detection / segmentation mode (`MODE` / `--mode`)
+
+- **`fasam` (default, M3b):** Uses `RTMPose` + `FAH` (`shared/detector.pt`, YOLOv8-seg) to lock Left/Right hand masks on clean separated frames as 2-ID anchors (`L=1, R=2`), tracks them across the whole clip with base **SAM 2.1** (`sam2_clipmask.py --mode fasam`), smooths tight square crops with SavGol, and runs **WiLoR** (`rescale=2.0`) before Rokoko `arm2d_fit.py` / `arm2d_filter.py`.
+- **`fah` (M3a):** Skips SAM 2.1 completely; runs `FAH` (`fah_detect.py --mode fah`) + `RTMPose` L/R Hungarian matching + short linear gap-fill (`1-3` frames) + SavGol smoothing -> **WiLoR** (`rescale=2.0`) -> `arm2d_fit.py` / `arm2d_filter.py`.
+- **`hand5` (legacy):** Original repo pipeline (`RTMPose + Hand5` -> `SEG=sam2` or `SEG=sam3` -> `WiLoR`).
+
+Options: `--mode` / `MODE=fasam` (default, M3b), `fah` (M3a), or `hand5`; `WRIST=wilor` (default) or `hand5`; `SEG=sam2` (default for `MODE=hand5`) or `sam3`; `LEN=240`.
+Note: `MODE=fasam` and `MODE=fah` require `bash download_fah.sh` first (or `FAH_DET=/path/to/detector.pt`).
 
 ## 5. Output: `OUT_ROOT/<date>/<group>/<session>/`
 
@@ -117,9 +128,9 @@ Rokoko axes: y up, **left-handed**. Mirror x for a right-handed frame: position 
 | 1 sync | `prepare_mocap.py`, `fit_rokoko.py` | pairs video and CSV, measures the clock offset from motion, one Rokoko row per video frame |
 | 2 clean | `clean_mocap.py` | cuts stream freezes > 0.5 s, repairs glitches and smooths joint directions (bone lengths never change), drops pieces < 3 s, removes wrong poses |
 | 3 camera | `camera_adapter.py`, `rokoko_cam.py` | head -> camera geometry from motion |
-| 4 detect | `hung5_detect.py` | hand5 wrists, RTMPose elbows / shoulders |
-| 5 masks | `sam2_clipmask.py` (or `handseg_clipmask.py`) | wearer's arm + hand masks, fine-tuned SAM 2.1 base+ |
-| 6 hands | `wilor_wrists.py`, `hand_track.py` | WiLoR on our masks, sides tracked, wrists smoothed |
+| 4 detect | `hung5_detect.py`, `fah_detect.py` | RTMPose elbows/shoulders/wrists + FAH YOLOv8-seg (`fasam`/`fah`, default) or Hand5 (`hand5`) |
+| 5 masks | `sam2_clipmask.py` (or `handseg_clipmask.py`) | `fasam`: 2-ID SAM 2.1 (`L=1, R=2`) on FAH anchors -> `masks.npz` + `fah_boxes.npz`; skipped in `fah`; `hand5`: wearer + hand masks |
+| 6 hands | `wilor_wrists.py`, `hand_track.py` | WiLoR on `fah_boxes.npz` (`fasam`/`fah`, `rescale=2.0`) or `masks.npz` (`hand5`) -> `wilor_wrists.npz` |
 | 7 arm fit | `arm2d_fit.py` | small camera correction (<= 3 deg, <= 5 cm), then arms bent to wrists and masks |
 | 8 filter | `arm2d_filter.py` | drops stretches where the arms still miss the image |
 | QA | `sync_check.py`, `make_split.py` | Rokoko head vs ARKit; train / test split |
@@ -143,4 +154,4 @@ twist below 60 deg, drift shorter than ~5 s, wrong legs while standing, and swap
 - Rokoko hip heading drifts away from the shoulders in some recordings (see the sample dataset); not corrected here.
 - Self-check of the cleaner: `python test_clean_mocap.py`.
 
-Third-party licenses: `licenses/NOTICE.md`. WiLoR (CC BY-NC-ND) and MANO are non-commercial.
+Third-party licenses: `licenses/NOTICE.md`. WiLoR (CC BY-NC-ND), MANO, and FAH `shared/detector.pt` (`WEIGHTS_LICENSE`) are non-commercial; Ultralytics YOLO weights use AGPL-3.0.

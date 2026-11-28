@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 """Wearer arm / hand masks on a cut clip with the fine-tuned SAM 2.1 base+ (handseg_model/sam2_ft.py), prompted only
-from the clip's detections (hand5 + RTMPose, hung5_detect.py) - no SAM 3.
+from the clip's detections (hand5 + RTMPose, hung5_detect.py) or FAH YOLO-seg (`--mode fasam`, default) - no SAM 3.
 
-    python sam2_clipmask.py CLIP_DIR [CLIP_DIR ...] [--ckpt BEST.pth]          (~/envs/handseg, GPU)
+    python sam2_clipmask.py CLIP_DIR [CLIP_DIR ...] [--mode fasam|hand5] [--ckpt BEST.pth]  (~/envs/handseg, GPU)
 
-Prompt points of a frame (confident sides only, arm2d_fit.observations): hand object = hand5 wrist + palm (middle
-knuckle); wearer object = those + RTMPose elbow + forearm midpoint.  Each object is tracked on its own (the learned type
-token of sam2_ft tells the decoder which one), from its own memory once prompted:
-  1 keyframe = the frame with the most confident sides: prompt, track forward and backward to the clip ends;
-  2 walking away from the keyframe (both ways), a confident detection re-prompts when its wrist is > AGREE_PX from the
-    hand mask (drift, or a hand never prompted) or the hand mask was empty for >= GAP frames before it (hand came back);
-    a re-prompt replaces the masks from there on and is also tracked back, OR-ed into the earlier frames until its hand
-    mask is empty for STOP frames (the hand was already there before the detector became confident).
-Wearer check: a keyframe / re-prompt counts only if its wrist's piece touches the bottom edge or lies within ROKOKO_PX of the
-Rokoko wrist of that side (validate(); a "confident" hand5 on a bystander is rejected, the next candidate tried); then a
-piece stays only if it holds such a prompt, continues a kept piece of the neighbouring frame within GROW px, or comes in
-through the bottom edge (temporal_wearer()): a mask jumping onto a bystander is dropped.
-Writes CLIP_DIR/masks.npz (--name): hand, wearer (n, H/4, W/4) bool (as handseg_clipmask.py); no confident detection -> empty.
+Modes:
+  fasam  (default, M3b) SAM 2.1 base+ (same 640x480 / bfloat16 / init_state config) prompted by FAH YOLO-seg apart L/R
+         masks (fah_prompts.npz) with 2 IDs (L=1, R=2) -> masks.npz (hand, hand_lr, empty wearer) + smoothed fah_boxes.npz
+  hand5  original main behavior: fine-tuned SAM 2.1 base+ prompted from hands.npz + RTMPose (WEARER/HAND 2-pass)
 """
 import argparse
 import shutil
@@ -27,6 +18,7 @@ import cv2
 import numpy as np
 import torch
 from sam2.build_sam import build_sam2_video_predictor
+from scipy.signal import savgol_filter
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import settings                                                             # noqa: E402
@@ -219,23 +211,159 @@ def clip_masks(p, cd, wd):
     return temporal_wearer(M, anchors), log
 
 
+def select_anchors(apart_idx, min_step=15):
+    """Choose clean apart anchor frames covering contiguous segment boundaries and spaced by min_step."""
+    if not len(apart_idx):
+        return []
+    anchors = [int(apart_idx[0])]
+    for i in range(1, len(apart_idx)):
+        cur, prev = int(apart_idx[i]), int(apart_idx[i - 1])
+        if (cur - prev > 1) or (cur - anchors[-1] >= min_step):
+            if prev not in anchors and cur - prev > 1:
+                anchors.append(prev)
+            if cur not in anchors:
+                anchors.append(cur)
+    if int(apart_idx[-1]) not in anchors:
+        anchors.append(int(apart_idx[-1]))
+    return sorted(set(anchors))
+
+
+def smooth_boxes_from_masks(M, frame_wh, min_area_trk=40, win=5):
+    """M: (n, 2, Ht, Wt) bool -> (n, 2, 4) SavGol-smoothed full-res square boxes, plus valid (n, 2)."""
+    n, _, Ht, Wt = M.shape
+    Wc, Hc = frame_wh
+    sx, sy = float(Wc) / Wt, float(Hc) / Ht
+    cxs = np.full((n, 2, 3), np.nan, np.float64)
+    raw_valid = np.zeros((n, 2), bool)
+    for f in range(n):
+        for s in (0, 1):
+            ys, xs = np.nonzero(M[f, s])
+            if len(xs) < min_area_trk:
+                continue
+            raw_valid[f, s] = True
+            x1, x2 = float(xs.min()) * sx, (float(xs.max()) + 1.0) * sx
+            y1, y2 = float(ys.min()) * sy, (float(ys.max()) + 1.0) * sy
+            cxs[f, s, 0] = 0.5 * (x1 + x2)
+            cxs[f, s, 1] = 0.5 * (y1 + y2)
+            cxs[f, s, 2] = max(x2 - x1, y2 - y1)
+
+    for s in (0, 1):
+        ok = np.isfinite(cxs[:, s, 0])
+        f_idx = 0
+        while f_idx < n:
+            if not ok[f_idx]:
+                f_idx += 1
+                continue
+            j_idx = f_idx
+            while j_idx < n and ok[j_idx]:
+                j_idx += 1
+            seg = j_idx - f_idx
+            if seg >= win:
+                for d_i in range(3):
+                    cxs[f_idx:j_idx, s, d_i] = savgol_filter(cxs[f_idx:j_idx, s, d_i], window_length=win, polyorder=2)
+            elif seg >= 3:
+                for d_i in range(3):
+                    cxs[f_idx:j_idx, s, d_i] = savgol_filter(cxs[f_idx:j_idx, s, d_i], window_length=3, polyorder=1)
+            f_idx = j_idx
+
+    boxes = np.full((n, 2, 4), np.nan, np.float32)
+    for s in (0, 1):
+        ok = np.isfinite(cxs[:, s, 0])
+        sz = np.maximum(cxs[ok, s, 2], 20.0)
+        boxes[ok, s, 0] = cxs[ok, s, 0] - 0.5 * sz
+        boxes[ok, s, 1] = cxs[ok, s, 1] - 0.5 * sz
+        boxes[ok, s, 2] = cxs[ok, s, 0] + 0.5 * sz
+        boxes[ok, s, 3] = cxs[ok, s, 1] + 0.5 * sz
+    return boxes, raw_valid
+
+
+def clip_masks_fasam(p, cd, wd):
+    """M3b: Track L (obj_id=1) and R (obj_id=2) masks across clip with SAM 2.1 prompted from fah_prompts.npz."""
+    pz = np.load(cd / "fah_prompts.npz")
+    anchor_frames = pz["anchor_frames"].astype(int)
+    anchor_masks = pz["anchor_masks"]
+    Wt, Ht = (int(x) for x in pz["tracker_wh"]) if "tracker_wh" in pz else (W, H)
+    frame_to_idx = {int(f): idx for idx, f in enumerate(anchor_frames)}
+    anchors = select_anchors(anchor_frames, min_step=15)
+
+    cap = cv2.VideoCapture(str(cd / "clip.mp4"))
+    Hc, Wc = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    shutil.rmtree(wd, ignore_errors=True)
+    wd.mkdir(parents=True)
+    n = 0
+    while True:
+        ok, im = cap.read()
+        if not ok:
+            break
+        if anchors:
+            cv2.imwrite(str(wd / f"{n:05d}.jpg"), cv2.resize(im, (Wt, Ht), interpolation=cv2.INTER_AREA))
+        n += 1
+    cap.release()
+
+    M = np.zeros((n, 2, Ht, Wt), bool)
+    if anchors and n > 0:
+        st = p.init_state(video_path=str(wd))
+        for fa in anchors:
+            idx = frame_to_idx[fa]
+            p.add_new_mask(st, frame_idx=fa, obj_id=1, mask=anchor_masks[idx, 0])
+            p.add_new_mask(st, frame_idx=fa, obj_id=2, mask=anchor_masks[idx, 1])
+        f0 = anchors[0]
+        for k, obj_ids, logits in p.propagate_in_video(st, start_frame_idx=f0, reverse=False):
+            for j, oid in enumerate(obj_ids):
+                M[k, int(oid) - 1] = (logits[j, 0] > 0).cpu().numpy()
+        if f0 > 0:
+            for k, obj_ids, logits in p.propagate_in_video(st, start_frame_idx=f0, reverse=True):
+                for j, oid in enumerate(obj_ids):
+                    M[k, int(oid) - 1] = (logits[j, 0] > 0).cpu().numpy()
+        p.reset_state(st)
+    shutil.rmtree(wd, ignore_errors=True)
+    return M, (Wc, Hc), anchors, pz["scores"][:n]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("clips", nargs="+", type=Path)
-    ap.add_argument("--ckpt", default=CKPT)
+    ap.add_argument("--mode", choices=["fasam", "hand5"], default="fasam")
+    ap.add_argument("--ckpt", default=None)
     ap.add_argument("--name", default="masks", help="output CLIP_DIR/<name>.npz (keep masks.npz when comparing models)")
     a = ap.parse_args()
     torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
-    p = model(a.ckpt)
-    for cd in a.clips:
-        M, log = clip_masks(p, cd, cd / "frames_tmp")
-        cap = cv2.VideoCapture(str(cd / "clip.mp4"))
-        Hc, Wc = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        q = lambda m: cv2.resize(m.astype(np.uint8), (Wc // 4, Hc // 4), interpolation=cv2.INTER_NEAREST) > 0
-        hand = np.stack([q(h & w) for w, h in M])
-        np.savez_compressed(cd / f"{a.name}.npz", hand=hand, wearer=np.stack([q(w) for w, _ in M]))
-        print(cd.name, f"prompts tried {log['tried']} accepted {log['accepted']} rejected {log['rejected']} | frames with hand {hand.any((1, 2)).mean():.2f}",
-              flush=True)
+    if a.mode == "fasam":
+        p = build_sam2_video_predictor(CFG, a.ckpt or settings.SAM2_BASE)
+        for cd in a.clips:
+            M, (Wc, Hc), anchors, raw_scores = clip_masks_fasam(p, cd, cd / "frames_tmp")
+            sm_boxes, valid = smooth_boxes_from_masks(M, (Wc, Hc))
+            np.savez_compressed(
+                cd / "fah_boxes.npz",
+                boxes=sm_boxes,
+                raw_valid=valid,
+                fill_valid=valid,
+                scores=np.where(valid, np.where(np.isfinite(raw_scores), raw_scores, np.float32(1.0)), np.float32(np.nan)),
+                anchors=np.array(anchors, np.int32),
+                mode=np.array("fasam"),
+            )
+            q = lambda m: cv2.resize(m.astype(np.uint8), (Wc // 4, Hc // 4), interpolation=cv2.INTER_NEAREST) > 0
+            hand_lr = np.stack([np.stack([q(mL), q(mR)], axis=0) for mL, mR in M]) if len(M) else np.zeros((0, 2, Hc // 4, Wc // 4), bool)
+            hand = hand_lr.any(1) if len(hand_lr) else np.zeros((0, Hc // 4, Wc // 4), bool)
+            wearer = np.zeros_like(hand)
+            np.savez_compressed(cd / f"{a.name}.npz", hand=hand, hand_lr=hand_lr, wearer=wearer)
+            print(
+                cd.name,
+                f"[M3b fasam] anchors={len(anchors)} | L={100 * valid[:, 0].mean():.1f}% R={100 * valid[:, 1].mean():.1f}%",
+                flush=True,
+            )
+    else:
+        p = model(a.ckpt or CKPT)
+        for cd in a.clips:
+            M, log = clip_masks(p, cd, cd / "frames_tmp")
+            cap = cv2.VideoCapture(str(cd / "clip.mp4"))
+            Hc, Wc = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            cap.release()
+            q = lambda m: cv2.resize(m.astype(np.uint8), (Wc // 4, Hc // 4), interpolation=cv2.INTER_NEAREST) > 0
+            hand = np.stack([q(h & w) for w, h in M])
+            np.savez_compressed(cd / f"{a.name}.npz", hand=hand, wearer=np.stack([q(w) for w, _ in M]))
+            print(cd.name, f"prompts tried {log['tried']} accepted {log['accepted']} rejected {log['rejected']} | frames with hand {hand.any((1, 2)).mean():.2f}",
+                  flush=True)
 
 
 if __name__ == "__main__":

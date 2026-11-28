@@ -89,16 +89,21 @@ def capped(x, m):
 
 
 def observations(cd, n):
-    h, r = np.load(cd / "hands.npz"), np.load(cd / "rtm_body.npz")
-    w, conf = np.full((n, 2, 2), np.nan), np.zeros((n, 2), bool)
-    p1, p2 = h["pass"] == 1, h["pass"] == 2
-    kp2d = h["kp2d"].reshape(len(h["pass"]), 21, 2)                            # no hand in the clip: saved as (0,)
-    k1, k2, fr, hd = kp2d[p1], kp2d[p2], h["frame"][p2].astype(int), h["hand"][p2].astype(int)
+    r = np.load(cd / "rtm_body.npz")
     kp, cf = np.full((n, 17, 2), np.nan), np.zeros((n, 17))
-    kp[r["frame"]], cf[r["frame"]] = r["kp"], r["conf"]
-    w[fr, hd] = k2[:, 0]
-    agree = np.linalg.norm(k1[:, 0] - k2[:, 0], axis=1) / np.linalg.norm(k2[:, 0] - k2[:, 9], axis=1).clip(1) < P12
-    conf[fr, hd] = agree & (np.linalg.norm(kp[fr, 9 + hd] - k2[:, 0], axis=1) < RTM_AGREE)
+    keep = r["frame"] < n
+    kp[r["frame"][keep]], cf[r["frame"][keep]] = r["kp"][keep], r["conf"][keep]
+    w, conf = np.full((n, 2, 2), np.nan), np.zeros((n, 2), bool)
+    if (cd / "hands.npz").exists():
+        h = np.load(cd / "hands.npz")
+        p1, p2 = h["pass"] == 1, h["pass"] == 2
+        kp2d = h["kp2d"].reshape(len(h["pass"]), 21, 2)                            # no hand in the clip: saved as (0,)
+        k1, k2, fr, hd = kp2d[p1], kp2d[p2], h["frame"][p2].astype(int), h["hand"][p2].astype(int)
+        in_n = (fr >= 0) & (fr < n)
+        k1, k2, fr, hd = k1[in_n], k2[in_n], fr[in_n], hd[in_n]
+        w[fr, hd] = k2[:, 0]
+        agree = np.linalg.norm(k1[:, 0] - k2[:, 0], axis=1) / np.linalg.norm(k2[:, 0] - k2[:, 9], axis=1).clip(1) < P12
+        conf[fr, hd] = agree & (np.linalg.norm(kp[fr, 9 + hd] - k2[:, 0], axis=1) < RTM_AGREE)
     inside = (kp[:, 7:9] >= 0).all(-1) & (kp[:, 7:9, 0] < 1920) & (kp[:, 7:9, 1] < 1440)
     hidden = ~np.isfinite(w).all(-1)                                            # no hand5 wrist on that side
     ok = (cf[:, 7:9] >= EL_CONF) & (~hidden | ((cf[:, 7:9] >= EL_CONF_NODET) & inside))
@@ -108,7 +113,22 @@ def observations(cd, n):
 
 
 def wrists(cd, n, src):
-    """observations() with the wrist target of --wrist (the elbow gate follows: hidden = no wrist of that source)."""
+    """observations() with the wrist target of --wrist (falls back to wilor_wrists + RTMPose when hands.npz is absent)."""
+    if src != "hand5" and not (cd / "hands.npz").exists():
+        r = np.load(cd / "rtm_body.npz")
+        kp, cf = np.full((n, 17, 2), np.nan), np.zeros((n, 17))
+        keep = r["frame"] < n
+        kp[r["frame"][keep]], cf[r["frame"][keep]] = r["kp"][keep], r["conf"][keep]
+        V = np.full((n, 2, 2), np.nan)
+        k = np.load(cd / "wilor_wrists.npz")["wrist"][:n]
+        V[:len(k)] = k
+        rtm_w = np.where((cf[:, 9:11] >= 0.3)[..., None], kp[:, 9:11], np.nan)
+        rtm_ok = np.isfinite(rtm_w).all(-1)
+        conf = np.isfinite(V).all(-1) & (~rtm_ok | (np.linalg.norm(V - rtm_w, axis=-1) < RTM_AGREE))
+        inside = (kp[:, 7:9] >= 0).all(-1) & (kp[:, 7:9, 0] < 1920) & (kp[:, 7:9, 1] < 1440)
+        ok = (cf[:, 7:9] >= EL_CONF) & (np.isfinite(V).all(-1) | ((cf[:, 7:9] >= EL_CONF_NODET) & inside))
+        sh = np.where((cf[:, 5:7] >= SH_CONF)[..., None], kp[:, 5:7], np.nan)
+        return V, conf, np.where(ok[..., None], kp[:, 7:9], np.nan), sh
     w, conf, e, sh = observations(cd, n)
     if src == "hand5":
         return w, conf, e, sh
@@ -373,17 +393,35 @@ def main():
         sd = Path((cd / "session.txt").read_text().strip())
         f0 = int((cd / "f0.txt").read_text())
         z = np.load(sd / "camera/rokoko_cam.npz")
-        n = min(int(cv2.VideoCapture(str(cd / "clip.mp4")).get(cv2.CAP_PROP_FRAME_COUNT)),    # header can count a last
-                len(np.load(cd / "masks.npz")["hand"]))                                      # packet flagged discard
-        J = {j: torch.tensor(z[j][f0:f0 + n].astype(float)) for j in z.files if j not in ("Ku", "Ruw", "tuw")}
-        P = Proj(z)
-        w, conf, e, _ = wrists(cd, n, a.wrist)
-        dt, hm = distance_outside(cd, n)
-        bl = hand_blobs(cd, n)
-        agree = sam_agree(cd, w)
-        rep = conf.any(1) & hm.any((1, 2))                                     # lengths: confident wrist + arm mask
-        cam_seg = fit(J, P, w, conf, e, "cam", seg_dt=dt, blobs=bl)["cam"]          # 1 phone onto the arm segmentation
-        L = fit(J, P, w, conf, e, "arm", rep=rep, cam=cam_seg, seg_dt=dt, blobs=bl, agree=agree)["len"]
+        cap = cv2.VideoCapture(str(cd / "clip.mp4"))
+        Hc = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1440
+        Wc = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+        nf = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        has_masks = (cd / "masks.npz").exists()
+        if has_masks:
+            mz = np.load(cd / "masks.npz")
+            n = min(nf, len(mz["hand"]))                                             # header can count a last packet flagged discard
+            J = {j: torch.tensor(z[j][f0:f0 + n].astype(float)) for j in z.files if j not in ("Ku", "Ruw", "tuw")}
+            P = Proj(z)
+            w, conf, e, _ = wrists(cd, n, a.wrist)
+            dt, hm = distance_outside(cd, n)
+            bl = hand_blobs(cd, n)
+            agree = sam_agree(cd, w)
+            hand_any = mz["hand"][:n].any((1, 2))
+            rep = conf.any(1) & (hm.any((1, 2)) if hm.any() else (hand_any if hand_any.any() else True))
+        else:
+            n = nf
+            J = {j: torch.tensor(z[j][f0:f0 + n].astype(float)) for j in z.files if j not in ("Ku", "Ruw", "tuw")}
+            P = Proj(z)
+            w, conf, e, _ = wrists(cd, n, a.wrist)
+            dt = np.zeros((n, Hc // 4, Wc // 4), float)
+            hm = np.zeros((n, Hc // 4, Wc // 4), bool)
+            bl = (torch.zeros((n, 1, BLOB_PTS, 2)), torch.zeros((n, 1), dtype=torch.bool))
+            agree = np.zeros(conf.shape, bool)
+            rep = conf.any(1)
+        cam_seg = fit(J, P, w, conf, e, "cam", seg_dt=dt if hm.any() else None, blobs=bl if bl[1].any() else None)["cam"]  # 1 phone onto segmentation
+        L = fit(J, P, w, conf, e, "arm", rep=rep, cam=cam_seg, seg_dt=dt if hm.any() else None, blobs=bl if bl[1].any() else None, agree=agree)["len"]
         D[cd] = dict(sd=sd, f0=f0, z=z, n=n, J=J, P=P, w=w, conf=conf, e=e, dt=dt, hm=hm, bl=bl, rep=rep, cam=cam_seg, L=L, agree=agree)
         print(cd.name, "clip lengths (cm)", (100 * L).cpu().numpy().round(1), "from", int(rep.sum()), "frames", flush=True)
     for sd in {v["sd"] for v in D.values()}:                                    # one pair of lengths per session
@@ -404,7 +442,7 @@ def main():
         wh, ch = np.where(hide[..., None], np.nan, w), conf & ~hide
         res = {}
         for seg in (False, True):
-            kw = dict(cam=cam_seg, seg_dt=dt, blobs=bl) if seg else {}
+            kw = dict(cam=cam_seg, seg_dt=dt if hm.any() else None, blobs=bl if bl[1].any() else None) if seg else {}
             res[seg] = fit(J, P, w, conf, e, "arm", lengths=v["Ls"], agree=v["agree"], **kw)
             ho = fit(J, P, wh, ch, e, "arm", lengths=v["Ls"], agree=v["agree"] & ~hide, **kw)
             pw = np.stack([Pnp(ho["out"]["W", i]) for i in range(2)], 1)

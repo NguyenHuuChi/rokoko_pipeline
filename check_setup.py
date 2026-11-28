@@ -30,6 +30,8 @@ for f in (M / "hand5/hand5_r17d.pt", M / "hand5/rtmpose_m_hand5_clip2max.onnx", 
 for f in ("wilor/models/wilor.py", "pretrained_models/wilor_final.ckpt", "mano_data/MANO_RIGHT.pkl"):
     need((Path(S.WILOR) / f).is_file(), f"WiLoR {f} (not needed with WRIST=hand5)")
 for f in (S.SAM2_LARGE, S.SAM3):
-    print("ok     " if Path(f).is_file() else "absent ", f"{f} (only SEG=sam3)")
+    print("ok     " if Path(f).is_file() else "absent ", f"{f} (only MODE=hand5 SEG=sam3)")
+print("ok     " if Path(S.FAH_DET).is_file() else "absent ", f"FAH weights {S.FAH_DET} (bash download_fah.sh; required for MODE=fasam|fah)")
+print("ok     " if (Path(S.FAH) / "fah/detector.py").is_file() else "absent ", f"FAH arch {Path(S.FAH) / 'fah/detector.py'} (bash download_fah.sh)")
 print("all set" if not bad else f"{bad} missing")
 raise SystemExit(bool(bad))

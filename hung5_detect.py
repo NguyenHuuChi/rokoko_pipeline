@@ -32,13 +32,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("video", type=Path)
     ap.add_argument("out", type=Path)
+    ap.add_argument("--rtm-only", action="store_true", help="only run RTMPose + body_prior (skip Hand5)")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     R.RTMPose.__init__ = cuda_init
     R.video(a.video, a.out / "rtm_body.npz")
-    sys.argv = ["body_prior.py", str(a.out / "rtm_body.npz"), str(a.out / "body_prior.npz"), "--wh", "1920,1440"]
+    import cv2
+    cap = cv2.VideoCapture(str(a.video))
+    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920, int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1440
+    cap.release()
+    sys.argv = ["body_prior.py", str(a.out / "rtm_body.npz"), str(a.out / "body_prior.npz"), "--wh", f"{w},{h}"]
     import body_prior
     body_prior.main()
+    if a.rtm_only:
+        return
     sys.modules["ultralytics"] = types.SimpleNamespace(YOLO=lambda *_: None)   # --no-yolo: the model is never called
     import detect_hands_student as D
     D.main([str(a.video), str(a.out / "hands.npz"), "--ckpt", str(PP.MODEL_ROOT / "hand5/hand5_r17d.pt"), "--prior",
